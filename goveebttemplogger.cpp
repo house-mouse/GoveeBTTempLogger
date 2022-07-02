@@ -84,6 +84,12 @@
 #include <utime.h>
 #include <vector>
 
+#define WITH_MQTT
+#ifdef WITH_MQTT
+#include "mqtt/async_client.h"
+
+#endif // WITH_MQTT
+
 /////////////////////////////////////////////////////////////////////////////
 static const std::string ProgramVersionString("GoveeBTTempLogger Version 2.20220619-1 Built on: " __DATE__ " at " __TIME__);
 /////////////////////////////////////////////////////////////////////////////
@@ -1654,6 +1660,7 @@ void ConnectAndDownload(int device_handle)
 }
 /////////////////////////////////////////////////////////////////////////////
 int LogFileTime = 60;
+int MqttTime = 10;
 int MinutesAverage = 5;
 bool DownloadData = false;
 static void usage(int argc, char **argv)
@@ -1695,6 +1702,78 @@ static const struct option long_options[] = {
 		{ "download",no_argument,NULL, 'd' },
 		{ 0, 0, 0, 0 }
 };
+
+#ifdef WITH_MQTT
+
+const int  QOS = 1;
+
+const auto TIMEOUT = std::chrono::seconds(10);
+
+void publish_mqtt(mqtt::async_client &mqtt, const std::string &topic_prefix, const std::string device_address, const Govee_Temp &gt) {
+
+    // generate message
+    std::ostringstream mqtt_outStream;
+    mqtt_outStream << "{";
+    mqtt_outStream << "\"temp\":"  << std::dec << gt.GetTemperature() << ",";
+    mqtt_outStream << "\"hum\":" <<  gt.GetHumidity() << ",";
+    mqtt_outStream << "\"bat\":" << gt.GetBattery() << ",";
+    mqtt_outStream << "\"model\":" << (int)gt.GetModel() << "}";
+//    mqtt_outStream << "\"ma\":" << int(gt.ma) << ",";
+//    mqtt_outStream << "\"rssi\":" << int(gt.rssi) << "}";
+
+    std::string mqtt_topic_complete = topic_prefix+"/"+device_address+"/DTA";
+
+    // send message
+    try {
+        mqtt::message_ptr pubmsg = mqtt::make_message(mqtt_topic_complete, mqtt_outStream.str().c_str());
+        pubmsg->set_qos(QOS);
+        mqtt.publish(pubmsg)->wait_for(TIMEOUT);
+    } catch (const mqtt::exception& exc) {
+        std::cerr << "Error creating MQTT message. " << exc.what() << std::endl;
+    }
+	
+}
+
+std::string hex_ba(const bdaddr_t &a) {
+	char addr[19] = { 0 };
+	ba2str(&a, addr);
+	std::string btAddress(addr);
+	for (auto pos = btAddress.find(':'); pos != std::string::npos; pos = btAddress.find(':'))
+		btAddress.erase(pos, 1);
+	return btAddress;
+}
+
+bool PublishMqtt(mqtt::async_client &mqtt, const std::string &topic_prefix, std::map<bdaddr_t, std::queue<Govee_Temp>> &AddressTemperatureMap) {
+  std::cout << "Publishing" << std::endl;
+	for (auto it = AddressTemperatureMap.begin(); it != AddressTemperatureMap.end(); ++it) {
+		if (!it->second.empty()) {
+        // Only send the most recent:
+  std::cout << "Publishing data" << std::endl;
+        publish_mqtt(mqtt, topic_prefix, hex_ba(it->first), it->second.back());
+  	}
+  }
+}
+
+/**
+ * A callback class for use with the main MQTT client.
+ */
+class callback : public virtual mqtt::callback
+{
+public:
+	void connection_lost(const std::string& cause) override {
+		std::cout << "\nConnection lost" << std::endl;
+		if (!cause.empty())
+			std::cout << "\tcause: " << cause << std::endl;
+	}
+
+	void delivery_complete(mqtt::delivery_token_ptr tok) override {
+		std::cout << "\tDelivery complete for token: "
+			<< (tok ? tok->get_message_id() : -1) << std::endl;
+	}
+};
+
+#endif // WITH_MQTT
+
 /////////////////////////////////////////////////////////////////////////////
 int main(int argc, char **argv)
 {
@@ -1703,6 +1782,29 @@ int main(int argc, char **argv)
 	std::string MRTGAddress;
 	bdaddr_t OnlyFilterAddress = { 0 };
 	const bdaddr_t NoFilterAddress = { 0 };
+
+
+
+#ifdef WITH_MQTT
+
+  const std::string DFLT_SERVER_ADDRESS	{ "tcp://localhost:1883" };
+  const std::string CLIENT_ID				{ "paho_cpp_async_publish" };
+  mqtt::async_client mqtt(DFLT_SERVER_ADDRESS, CLIENT_ID);
+
+	callback cb;
+	mqtt.set_callback(cb);
+
+	auto connOpts = mqtt::connect_options_builder()
+		.clean_session()
+//		.will(mqtt::message(TOPIC, LWT_PAYLOAD, QOS))
+		.finalize();
+
+		std::cout << "\nConnecting..." << std::endl;
+		mqtt::token_ptr conntok = mqtt.connect(connOpts);
+		std::cout << "Waiting for the connection..." << std::endl;
+		conntok->wait();
+		std::cout << "  ...OK" << std::endl;
+#endif // WITH_MQTT
 
 	for (;;)
 	{
@@ -1889,6 +1991,8 @@ int main(int argc, char **argv)
 
 								bRun = true;
 								time_t TimeStart, TimeSVG = 0;
+								time_t LastMqttTime=0;
+
 								time(&TimeStart);
 								while (bRun)
 								{
@@ -2136,6 +2240,13 @@ int main(int argc, char **argv)
 										TimeSVG = (TimeNow / DAY_SAMPLE) * DAY_SAMPLE; // hack to try to line up TimeSVG to be on a five minute period
 										WriteAllSVG();
 									}
+#ifdef WITH_MQTT
+									if (difftime(TimeNow, LastMqttTime) > MqttTime)
+									{
+										PublishMqtt(mqtt, "/govee", GoveeTemperatures);
+                    LastMqttTime=TimeNow;
+                  }
+#endif // WITH_MQTT
 									if (difftime(TimeNow, TimeStart) > LogFileTime)
 									{
 										if (ConsoleVerbosity > 0)
